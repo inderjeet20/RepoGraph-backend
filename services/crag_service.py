@@ -1,8 +1,12 @@
+"""
+CRAG (Corrective RAG) Pipeline — RepoGraph AI
+Strategy: REPO-FIRST. Use repository chunks whenever available.
+Only fall back to web for explicitly external queries with zero repo context.
+"""
 import json
 import warnings
 from typing import List, Dict, Any, Optional
 
-# Suppress ddgs package rename runtime warning
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*duckduckgo_search.*")
 try:
     from ddgs import DDGS
@@ -14,28 +18,52 @@ from google.genai import types
 from services.llm_service import get_genai_client, generate_trace_path
 from services.qdrant_service import search_repository_chunks
 
+# ── Single model: gemini-2.5-flash only ──────────────────────────────────────
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# ── Explicit external-knowledge patterns (ONLY go to web for these) ───────────
+EXTERNAL_PATTERNS = [
+    "what is the latest version",
+    "latest version of",
+    "latest release of",
+    "current stable version",
+    "how to install ",
+    "how do i install",
+    "getting started with ",
+    "official documentation",
+    "what is kubernetes",
+    "what is docker",
+    "what is react",
+    "what is python",
+    "what is flutter",
+    "what is django",
+    "what is fastapi",
+    "who created",
+    "who made ",
+    "when was it created",
+    "history of ",
+]
+
+
+def _is_external_query(message: str) -> bool:
+    """Returns True ONLY if the query is clearly about external world knowledge."""
+    lower = message.lower().strip()
+    return any(pat in lower for pat in EXTERNAL_PATTERNS)
+
+
 def free_web_search(query: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """
-    Performs completely free web search using DuckDuckGo.
-    Falls back to Tavily if TAVILY_API_KEY is configured.
-    """
-    # 1. Try DuckDuckGo (100% free, no API key needed)
+    """Performs web search using DuckDuckGo, falls back to Tavily."""
     try:
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
             if results:
                 return [
-                    {
-                        "title": r.get("title", ""),
-                        "url": r.get("href", ""),
-                        "snippet": r.get("body", "")
-                    }
+                    {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
                     for r in results
                 ]
     except Exception as e:
-        print(f"DuckDuckGo search error: {e}")
+        print(f"[CRAG] DuckDuckGo error: {e}")
 
-    # 2. Fallback to Tavily if key present
     if TAVILY_API_KEY:
         try:
             import httpx
@@ -45,23 +73,14 @@ def free_web_search(query: str, max_results: int = 3) -> List[Dict[str, str]]:
                     json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results}
                 )
                 if res.status_code == 200:
-                    data = res.json()
                     return [
-                        {
-                            "title": r.get("title", ""),
-                            "url": r.get("url", ""),
-                            "snippet": r.get("content", "")
-                        }
-                        for r in data.get("results", [])
+                        {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+                        for r in res.json().get("results", [])
                     ]
         except Exception as e:
-            print(f"Tavily search error: {e}")
+            print(f"[CRAG] Tavily error: {e}")
 
     return []
-
-
-# Correct Gemini model names (ordered from fastest to most capable)
-GEMINI_MODELS = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
 
 
 async def run_crag_pipeline(
@@ -69,199 +88,230 @@ async def run_crag_pipeline(
     message: str,
     node_context: Optional[Dict[str, Any]] = None,
     all_nodes: Optional[List[Dict[str, Any]]] = None,
-    all_edges: Optional[List[Dict[str, Any]]] = None
+    all_edges: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Corrective RAG (CRAG) execution with repo-first policy:
-    1. Retrieve repository chunks (focused by node_context if provided).
-    2. Evaluate sufficiency — biased toward repo when chunks exist.
-    3. Fallback to web only for genuinely external queries.
-    4. Generate structured, direct answer grounded in repo context.
-    5. Optionally computes highlighted_path for focus mode.
+    CRAG Pipeline — Repo-First Strategy:
+    
+    Decision tree (NO LLM evaluator — pure rule-based routing):
+      1. Explicitly external query (version, install, what-is-X)?
+         → YES: web search
+         → NO:  continue
+      2. Do we have Qdrant repo chunks?
+         → YES: answer from repo (ALWAYS — no second-guessing)
+         → NO:  do we have architecture nodes?
+                → YES: answer from architecture context
+                → NO:  web search as last resort
+    
+    The LLM evaluator was the bug — it kept returning insufficient=false.
+    Removed entirely. Routing is now deterministic.
     """
     client = get_genai_client()
     node_files = node_context.get("files", []) if node_context else []
-
     lower_msg = message.lower().strip()
 
-    # Detect explicit external-knowledge queries (not about this repo)
-    is_external_query = any(k in lower_msg for k in [
-        "latest version", "latest release", "what is the latest", "current version of",
-        "how to install", "tutorial for", "documentation for", "what is react", "what is python",
-        "what is flutter", "who made", "when was", "history of"
-    ])
+    # ── Step 1: Hard external-query check ────────────────────────────────────
+    if _is_external_query(message):
+        print(f"[CRAG] External query detected: '{message[:60]}' → web search")
+        web_results = free_web_search(message, max_results=3)
+        sources = [w["url"] for w in web_results if w.get("url")]
+        answer = await _generate_answer(
+            client=client,
+            repo_name=repo_name,
+            message=message,
+            source_type="web",
+            web_results=web_results,
+            repo_context="",
+            arch_block="",
+            node_block="",
+        )
+        return {"answer": answer, "sources": sources, "source_type": "web", "highlighted_path": []}
 
-    is_arch_query = any(k in lower_msg for k in [
-        "architecture", "system flow", "how does the app work", "how does the project work",
-        "overview", "components", "modules", "call hierarchy", "structure", "explain repo",
-        "how does this work", "what does this repo do", "what does this project do"
-    ])
+    # ── Step 2: Retrieve repo chunks from Qdrant ─────────────────────────────
+    repo_chunks = await search_repository_chunks(
+        repo_name, message, node_files=node_files, top_k=10
+    )
+    print(f"[CRAG] Retrieved {len(repo_chunks)} chunks from Qdrant for repo '{repo_name}'")
 
-    # Step 1: Retrieve repo chunks (more chunks = better evidence)
-    repo_chunks = await search_repository_chunks(repo_name, message, node_files=node_files, top_k=8)
-
-    repo_context_text = "\n\n".join([
-        f"File: {c.get('file')} (Lines {c.get('start_line')}-{c.get('end_line')}):\n{c.get('text')}"
+    repo_context = "\n\n".join([
+        f"### File: {c.get('file')} (Lines {c.get('start_line')}-{c.get('end_line')})\n{c.get('text', '')}"
         for c in repo_chunks
     ])
 
-    # Step 2: CRAG Sufficiency Evaluation (repo-first policy)
-    is_sufficient = False
+    # ── Step 3: Build architecture block ─────────────────────────────────────
+    arch_block = ""
+    is_arch_query = any(k in lower_msg for k in [
+        "architecture", "system flow", "how does the app work", "how does the project work",
+        "overview", "components", "modules", "call hierarchy", "structure", "explain repo",
+        "how does this work", "what does this repo do", "what does this project do",
+        "how is this built", "tech stack",
+    ])
+    if all_nodes:
+        nodes_list = [
+            f"- [{n.get('type', '').upper()}] {n.get('label')}: {n.get('description', '')}"
+            for n in all_nodes
+        ]
+        edges_list = [
+            f"- {e.get('source')} → {e.get('target')}: {e.get('label', 'calls')}"
+            for e in (all_edges or [])
+        ]
+        # Always include architecture if nodes exist — it's always useful context
+        arch_block = (
+            f"\n## Repository Architecture\n"
+            f"{chr(10).join(nodes_list)}\n"
+            f"\n## Data Flow\n"
+            f"{chr(10).join(edges_list)}\n"
+        )
 
-    if is_external_query:
-        # Explicitly external question — go to web
-        is_sufficient = False
-    elif is_arch_query and all_nodes and len(all_nodes) > 0:
-        # Architecture overview query with nodes — always sufficient from repo
-        is_sufficient = True
-    elif repo_chunks and len(repo_chunks) >= 2:
-        # We have meaningful repo chunks — evaluate with LLM but default to True
-        if client:
-            eval_prompt = f"""You are a Retrieval Evaluator in a Corrective RAG system for codebase '{repo_name}'.
-User Question: "{message}"
+    # ── Step 4: Build node block ──────────────────────────────────────────────
+    node_block = ""
+    if node_context:
+        node_block = (
+            f"\n## Selected Component: {node_context.get('label')} ({node_context.get('type')})\n"
+            f"Description: {node_context.get('description', '')}\n"
+            f"Files: {', '.join(node_files)}\n"
+        )
 
-Retrieved Repository Code Snippets ({len(repo_chunks)} chunks):
-{repo_context_text[:2500]}
+    # ── Step 5: REPO-FIRST routing decision ──────────────────────────────────
+    if repo_chunks:
+        # We have actual repo code — ALWAYS use it, no LLM evaluation needed
+        print(f"[CRAG] Using repo context ({len(repo_chunks)} chunks) for answer")
+        sources = [
+            f"{c.get('file')}:{c.get('start_line')}-{c.get('end_line')}"
+            for c in repo_chunks[:5]
+        ]
+        answer = await _generate_answer(
+            client=client,
+            repo_name=repo_name,
+            message=message,
+            source_type="repo",
+            web_results=[],
+            repo_context=repo_context,
+            arch_block=arch_block,
+            node_block=node_block,
+        )
+        source_type = "repo"
 
-Evaluate: Can these repository snippets help answer the user's question about THIS codebase?
+    elif all_nodes and len(all_nodes) > 0:
+        # No Qdrant chunks but we have architecture graph — use it
+        print(f"[CRAG] No Qdrant chunks; using architecture graph ({len(all_nodes)} nodes)")
+        sources = [n.get("label", "") for n in all_nodes[:4]]
+        answer = await _generate_answer(
+            client=client,
+            repo_name=repo_name,
+            message=message,
+            source_type="repo",
+            web_results=[],
+            repo_context="",
+            arch_block=arch_block,
+            node_block=node_block,
+        )
+        source_type = "repo"
 
-RULES:
-1. If snippets show relevant code/files/logic that pertains to this question → answer {{"sufficient": true}}
-2. If the question asks about EXTERNAL tools/versions/documentation not specific to this repo → answer {{"sufficient": false}}
-3. If the question is about this specific codebase and we have related code → answer {{"sufficient": true}}
-4. When in doubt, prefer {{"sufficient": true}} — let the repo answer first.
-
-Output ONLY JSON: {{"sufficient": true}} or {{"sufficient": false}}"""
-
-            for model in GEMINI_MODELS:
-                try:
-                    eval_res = client.models.generate_content(
-                        model=model,
-                        contents=eval_prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-                        )
-                    )
-                    eval_data = json.loads(eval_res.text)
-                    is_sufficient = eval_data.get("sufficient", True)
-                    break
-                except Exception as e:
-                    print(f"CRAG evaluation error ({model}): {e}")
-                    # If eval fails but we have chunks, assume sufficient (repo-first)
-                    is_sufficient = True
-        else:
-            # No LLM client but we have chunks — use them
-            is_sufficient = True
-    elif repo_chunks and len(repo_chunks) == 1:
-        # Single chunk — still try to use it
-        is_sufficient = True
     else:
-        # No chunks at all
-        is_sufficient = False
-
-    # Step 3: Web Search Fallback only if repo is insufficient
-    web_results = []
-    source_type = "repo"
-    sources = []
-
-    if not is_sufficient:
-        source_type = "web"
+        # Absolute last resort: web search
+        print(f"[CRAG] No repo context at all — falling back to web")
         web_results = free_web_search(message, max_results=3)
         sources = [w["url"] for w in web_results if w.get("url")]
+        answer = await _generate_answer(
+            client=client,
+            repo_name=repo_name,
+            message=message,
+            source_type="web",
+            web_results=web_results,
+            repo_context="",
+            arch_block="",
+            node_block=node_block,
+        )
+        source_type = "web"
 
-        # If web search returned nothing, fall back to repo chunks if available
-        if not sources and repo_chunks:
-            source_type = "repo"
-            is_sufficient = True
-            sources = [f"{c.get('file')}:{c.get('start_line')}-{c.get('end_line')}" for c in repo_chunks[:3]]
-    else:
-        source_type = "repo"
-        if repo_chunks:
-            sources = [f"{c.get('file')}:{c.get('start_line')}-{c.get('end_line')}" for c in repo_chunks[:4]]
-        elif node_files:
-            sources = list(node_files[:3])
-        elif all_nodes:
-            sources = [n.get("label", "Architecture") for n in all_nodes[:3]]
-
-    # Step 4: Generation — grounded, direct, concise
-    answer = ""
-    if client:
-        context_block = ""
-        if source_type == "web" and web_results:
-            web_block = "\n\n".join([f"Source ({w['url']}):\n{w['snippet']}" for w in web_results])
-            context_block += f"Web Search Results:\n{web_block}\n"
-        elif repo_context_text and is_sufficient:
-            context_block += f"Repository Code Snippets:\n{repo_context_text}\n"
-
-        arch_block = ""
-        if is_arch_query and all_nodes:
-            nodes_list = [
-                f"- [{n.get('type', 'module').upper()}] {n.get('label')}: {n.get('description', '')}"
-                for n in all_nodes
-            ]
-            edges_list = [
-                f"- {e.get('source')} -> {e.get('target')} ({e.get('label', 'calls')})"
-                for e in (all_edges or [])
-            ]
-            arch_block = f"\nArchitecture:\n{chr(10).join(nodes_list)}\nData Flow:\n{chr(10).join(edges_list)}\n"
-
-        node_block = ""
-        if node_context:
-            node_block = (
-                f"Selected Component: {node_context.get('label')} ({node_context.get('type')})\n"
-                f"Description: {node_context.get('description')}\n"
-                f"Files: {', '.join(node_files)}\n"
-            )
-
-        prompt = f"""You are RepoGraph AI, an expert software architecture analyst for the repository: {repo_name}
-{node_block}
-{arch_block}
-{context_block}
-
-User Question: "{message}"
-
-INSTRUCTIONS:
-1. Answer DIRECTLY and SPECIFICALLY from the repository code and architecture provided above.
-2. Reference actual file names, functions, classes, and code patterns you can see in the context.
-3. Use markdown formatting — headers, bullet lists, inline code (\`code\`), and code blocks when showing code.
-4. Be concise but complete. Developers want direct answers, not padding.
-5. If context is from web search, clearly say "Based on external documentation:".
-6. Do NOT fabricate details not present in the provided context."""
-
-        for model in GEMINI_MODELS:
-            try:
-                gen_res = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-                    )
-                )
-                answer = gen_res.text
-                if answer:
-                    break
-            except Exception as e:
-                print(f"CRAG answer generation error ({model}): {e}")
-                answer = "Unable to generate answer at this time. Please check your API key configuration."
-    else:
-        if source_type == "web":
-            answer = f"According to online documentation, here are the latest details regarding '{message}'."
-        elif node_context:
-            answer = f"The **{node_context.get('label')}** module ({node_context.get('type')}) defines: {node_context.get('description', '')}."
-        else:
-            answer = f"Repository overview for **{repo_name}**."
-
-    # Step 5: Trace path highlight for flow/trace queries
+    # ── Step 6: Trace path for flow/trace queries ─────────────────────────────
     highlighted_path = []
     if all_nodes and all_edges:
-        if any(k in lower_msg for k in ["trace", "flow", "how does", "pipeline", "lifecycle", "work", "login", "auth"]):
-            node_id = node_context.get("id", all_nodes[0]["id"]) if node_context else all_nodes[0]["id"]
+        if any(k in lower_msg for k in [
+            "trace", "flow", "how does", "pipeline", "lifecycle", "login", "auth",
+            "call chain", "execution", "request", "response",
+        ]):
+            node_id = (
+                node_context.get("id", all_nodes[0]["id"]) if node_context
+                else all_nodes[0]["id"]
+            )
             highlighted_path = await generate_trace_path(node_id, message, all_nodes, all_edges)
 
     return {
         "answer": answer,
         "sources": sources,
         "source_type": source_type,
-        "highlighted_path": highlighted_path
+        "highlighted_path": highlighted_path,
     }
+
+
+async def _generate_answer(
+    client,
+    repo_name: str,
+    message: str,
+    source_type: str,
+    web_results: List[Dict],
+    repo_context: str,
+    arch_block: str,
+    node_block: str,
+) -> str:
+    """Generates the final answer using gemini-2.5-flash."""
+    if not client:
+        if source_type == "web" and web_results:
+            return "\n\n".join([
+                f"**{r['title']}**\n{r['snippet']}" for r in web_results[:2]
+            ])
+        return f"Repository context loaded for **{repo_name}**. Ask me anything about the code."
+
+    # Build context block
+    if source_type == "web" and web_results:
+        context_section = (
+            "## Web Search Results\n"
+            + "\n\n".join([f"**Source**: {r['url']}\n{r['snippet']}" for r in web_results])
+        )
+        instruction = (
+            "Answer using ONLY the web search results above. "
+            "Clearly state this is based on external documentation."
+        )
+    else:
+        context_parts = []
+        if node_block:
+            context_parts.append(node_block)
+        if arch_block:
+            context_parts.append(arch_block)
+        if repo_context:
+            context_parts.append(f"## Repository Code Snippets\n{repo_context}")
+
+        context_section = "\n".join(context_parts) if context_parts else "(No code context retrieved)"
+        instruction = (
+            "Answer DIRECTLY from the repository code snippets and architecture above. "
+            "Reference specific file names, functions, classes, and line numbers you can see. "
+            "Do NOT answer from general knowledge — only from the provided context."
+        )
+
+    prompt = f"""You are RepoGraph AI — an expert codebase analyst for the repository: **{repo_name}**
+
+{context_section}
+
+---
+User Question: "{message}"
+
+INSTRUCTIONS:
+- {instruction}
+- Use markdown: headers, bullet lists, inline `code`, and code blocks.
+- Be concise and technical. Developers want direct, specific answers.
+- If the provided context does not contain enough info to answer, say exactly what you found and what's missing."""
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+            ),
+        )
+        return response.text or "No response generated."
+    except Exception as e:
+        print(f"[CRAG] Generation error ({GEMINI_MODEL}): {e}")
+        return f"Error generating answer: {e}. Please check your Gemini API key."

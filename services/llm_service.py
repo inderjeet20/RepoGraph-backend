@@ -113,7 +113,7 @@ Return ONLY valid JSON matching this exact structure:
   ]
 }}
 """
-        models_to_try = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
+        models_to_try = ["gemini-2.5-flash"]
         for model in models_to_try:
             try:
                 response = client.models.generate_content(
@@ -290,7 +290,7 @@ Return an ordered JSON array of node IDs that represent this execution sequence 
 Example: ["client_ui", "api_gateway", "auth_service", "database"]
 Only include node IDs from the provided graph. Return ONLY the JSON array.
 """
-        models_to_try = ["gemini-2.0-flash-lite", "gemini-2.0-flash", "gemini-2.5-flash"]
+        models_to_try = ["gemini-2.5-flash"]
         for model in models_to_try:
             try:
                 response = client.models.generate_content(

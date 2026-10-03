@@ -30,8 +30,8 @@ def _deterministic_fallback_vector(text: str) -> List[float]:
 
 def get_batch_text_embeddings(texts: List[str], batch_size: int = 40) -> List[List[float]]:
     """
-    Generates embeddings in efficient batches using Gemini embedding model.
-    Sends 40-50 texts per single HTTP request, reducing 60+ individual calls down to 1-2 calls (2-3 seconds total).
+    Generates embeddings in efficient batches using Gemini text-embedding-004.
+    Falls back to deterministic hash vectors if API fails.
     """
     if not texts:
         return []
@@ -45,7 +45,8 @@ def get_batch_text_embeddings(texts: List[str], batch_size: int = 40) -> List[Li
         batch_success = False
 
         if client:
-            for model_name in ["gemini-embedding-001", "text-embedding-004"]:
+            # Try text-embedding-004 first (stable), then gemini-embedding-001
+            for model_name in ["text-embedding-004", "gemini-embedding-001"]:
                 try:
                     from google.genai import types
                     res = client.models.embed_content(
@@ -57,16 +58,19 @@ def get_batch_text_embeddings(texts: List[str], batch_size: int = 40) -> List[Li
                         for emb in res.embeddings:
                             all_embeddings.append(emb.values)
                         batch_success = True
+                        print(f"[Qdrant] Embedded {len(batch)} texts with {model_name}")
                         break
                     elif hasattr(res, 'embedding') and res.embedding and res.embedding.values:
                         all_embeddings.append(res.embedding.values)
                         batch_success = True
+                        print(f"[Qdrant] Embedded 1 text with {model_name}")
                         break
                 except Exception as e:
-                    print(f"Batch embed attempt error ({model_name}): {e}")
+                    print(f"[Qdrant] Embed error ({model_name}): {e}")
                     continue
 
         if not batch_success:
+            print(f"[Qdrant] WARNING: Using fallback hash vectors for {len(batch)} texts — similarity search will be random!")
             for t in batch:
                 all_embeddings.append(_deterministic_fallback_vector(t))
 
